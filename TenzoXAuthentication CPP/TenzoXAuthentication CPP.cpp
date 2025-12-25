@@ -4,7 +4,7 @@
 #include <chrono>
 
 int main() {
-    TXA::Auth txa("Example", "6026bb04699ffdca3f4b8211c2c3d8d7", "1.0");
+    TXA::Auth txa("", "", "1.0");
 
     txa.Init();
 
@@ -94,4 +94,5 @@ int main() {
     std::cin.get();
 
     return 0;
+
 }
