@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <wininet.h>
 #include <wincrypt.h>
+#include <bcrypt.h>
 #include <iphlpapi.h>
 #include <iostream>
 #include <string>
@@ -16,10 +17,31 @@
 #include <ctime>
 #include <algorithm>
 #include <random>
+#include <cctype>
+#include <cstdlib>
+#include <stdexcept>
+#include <fstream>
 #include <sddl.h>
+#include "xorstr.hpp"
+
 #pragma comment(lib, "wininet.lib")
 #pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "iphlpapi.lib")
+
+#ifndef TXA_RESPONSE_SIGNING_PUBLIC_KEY_PEM
+#define TXA_RESPONSE_SIGNING_PUBLIC_KEY_PEM R"(-----BEGIN PUBLIC KEY-----
+MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAh3fjJEqt8/GbGNkhn9ws
+8v7cStTdgEv2712vsJUhyJXS/hhG6wLcTHCk/hY/+jICvAF7lsSAMmz4Nwntp62B
+cPj+OP6eWcX4WSSciK0O+i1qiF0QxXEFchvQCcUa3GVxrDLKFPB5/44ct+INqUV5
+dZZYhZl39zQcs+2zvY3kJGvOafopGhsuedMh7eLkPP09lUAXnX30yOyU4G71MXut
+mKo1V8M3F4O7G91s6bZLhxONOU6NhgSuykCM2u3hzP34nXC4uJe0Lx/8ENftWNwZ
+3Qf3cuXcXCZJsWSzEhfYSZX5waQOUoE5qqqslygoCt40lCP7qk1Z9drP9C9losxy
+f1vHTTismKkTnVHSZJRXu1wtYC79J8F3f8oG97uwo3p+p1LA+CdF1X69xSY0nFZu
+QF1qxkOV4NUrcOXra+blw8FaowKahBBzjJeAzjoTa02DxexQSk2kDVvPmUrOv68U
+L/i6HsvOzaC62R7mNOKiqaDB9bircvGj/BknhX5Etf5RAgMBAAE=
+-----END PUBLIC KEY-----)"
+#endif
 
 namespace TXA {
 
@@ -32,6 +54,27 @@ namespace TXA {
 
     class Auth {
     private:
+        struct ApiResponse {
+            bool Success = false;
+            std::string Message;
+            std::string ServerVersion;
+            std::string Username;
+            std::string Subscription;
+            std::string Expiry;
+            std::string Value;
+            std::string RequestNonce;
+            std::string ServerTimestamp;
+            std::string Signature;
+            std::map<std::string, std::string> Variables;
+        };
+
+        struct RequestContext {
+            std::string Endpoint;
+            std::string JsonBody;
+            std::string Nonce;
+            std::string Timestamp;
+        };
+
         std::string AppName;
         std::string Secret;
         std::string Version;
@@ -47,19 +90,346 @@ namespace TXA {
         UserData CurrentUser;
         std::map<std::string, std::string> Variables;
 
+        std::string ResponseSigningPublicKeyPem = TXA_RESPONSE_SIGNING_PUBLIC_KEY_PEM;
+        long long AllowedClockSkewSeconds = 120;
+        bool EnforceStrictSecurity = true;
+
         std::mutex varMutex;
         std::mutex responseMutex;
 
-        struct ApiResponse {
-            bool Success;
-            std::string Message;
-            std::map<std::string, std::string> Data;
-        };
+        static std::string TamperDetectedMessage() {
+            return _xor_("Tamper detected. Access blocked.").str();
+        }
+
+        void SetResponseMessage(const std::string& message) {
+            std::lock_guard<std::mutex> lock(responseMutex);
+            ResponseMessage = message;
+        }
+
+        static std::string JsonEscape(const std::string& input) {
+            std::ostringstream out;
+            for (unsigned char c : input) {
+                switch (c) {
+                case '\\': out << "\\\\"; break;
+                case '"': out << "\\\""; break;
+                case '\b': out << "\\b"; break;
+                case '\f': out << "\\f"; break;
+                case '\n': out << "\\n"; break;
+                case '\r': out << "\\r"; break;
+                case '\t': out << "\\t"; break;
+                default:
+                    if (c < 0x20) {
+                        out << "\\u"
+                            << std::hex << std::uppercase << std::setw(4) << std::setfill('0')
+                            << static_cast<int>(c)
+                            << std::dec << std::nouppercase;
+                    }
+                    else {
+                        out << static_cast<char>(c);
+                    }
+                }
+            }
+            return out.str();
+        }
+
+        static long long CurrentUnixTimeSeconds() {
+            return static_cast<long long>(std::time(nullptr));
+        }
+
+        static std::string TrimCopy(std::string value) {
+            auto notSpace = [](unsigned char c) { return !std::isspace(c); };
+            value.erase(value.begin(), std::find_if(value.begin(), value.end(), notSpace));
+            value.erase(std::find_if(value.rbegin(), value.rend(), notSpace).base(), value.end());
+            return value;
+        }
+
+        static std::string GenerateRandomHex(std::size_t byteCount = 16) {
+            std::vector<unsigned char> bytes(byteCount);
+            if (BCryptGenRandom(nullptr, bytes.data(), static_cast<ULONG>(bytes.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
+                throw std::runtime_error("Failed to generate secure random bytes");
+            }
+
+            static const char* hex = "0123456789ABCDEF";
+            std::string output;
+            output.reserve(byteCount * 2);
+
+            for (unsigned char byte : bytes) {
+                output.push_back(hex[(byte >> 4) & 0x0F]);
+                output.push_back(hex[byte & 0x0F]);
+            }
+
+            return output;
+        }
+
+        static std::string BytesToHexUpper(const BYTE* bytes, DWORD length) {
+            std::ostringstream out;
+            out << std::uppercase << std::hex << std::setfill('0');
+            for (DWORD i = 0; i < length; ++i) {
+                out << std::setw(2) << static_cast<int>(bytes[i]);
+            }
+            return out.str();
+        }
+
+        static std::string Sha256Hex(const std::string& data) {
+            BCRYPT_ALG_HANDLE algHandle = nullptr;
+            BCRYPT_HASH_HANDLE hashHandle = nullptr;
+            DWORD objectLength = 0;
+            DWORD resultLength = 0;
+            DWORD hashLength = 0;
+
+            if (BCryptOpenAlgorithmProvider(&algHandle, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0) {
+                throw std::runtime_error("Failed to open SHA-256 provider");
+            }
+
+            if (BCryptGetProperty(algHandle, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&objectLength), sizeof(objectLength), &resultLength, 0) != 0 ||
+                BCryptGetProperty(algHandle, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hashLength), sizeof(hashLength), &resultLength, 0) != 0) {
+                BCryptCloseAlgorithmProvider(algHandle, 0);
+                throw std::runtime_error("Failed to query SHA-256 properties");
+            }
+
+            std::vector<BYTE> hashObject(objectLength);
+            std::vector<BYTE> hashBytes(hashLength);
+
+            if (BCryptCreateHash(algHandle, &hashHandle, hashObject.data(), objectLength, nullptr, 0, 0) != 0 ||
+                BCryptHashData(hashHandle, reinterpret_cast<PUCHAR>(const_cast<char*>(data.data())), static_cast<ULONG>(data.size()), 0) != 0 ||
+                BCryptFinishHash(hashHandle, hashBytes.data(), hashLength, 0) != 0) {
+                if (hashHandle) {
+                    BCryptDestroyHash(hashHandle);
+                }
+                BCryptCloseAlgorithmProvider(algHandle, 0);
+                throw std::runtime_error("Failed to hash data");
+            }
+
+            BCryptDestroyHash(hashHandle);
+            BCryptCloseAlgorithmProvider(algHandle, 0);
+            return BytesToHexUpper(hashBytes.data(), hashLength);
+        }
+
+        static std::string ExtractJsonString(const std::string& json, const std::string& key) {
+            std::string token = "\"" + key + "\"";
+            std::size_t keyPos = json.find(token);
+            if (keyPos == std::string::npos) {
+                return "";
+            }
+
+            std::size_t colonPos = json.find(':', keyPos + token.length());
+            if (colonPos == std::string::npos) {
+                return "";
+            }
+
+            std::size_t firstQuote = json.find('"', colonPos + 1);
+            if (firstQuote == std::string::npos) {
+                return "";
+            }
+
+            std::string value;
+            bool escaped = false;
+            for (std::size_t i = firstQuote + 1; i < json.size(); ++i) {
+                char ch = json[i];
+                if (escaped) {
+                    switch (ch) {
+                    case '"': value.push_back('"'); break;
+                    case '\\': value.push_back('\\'); break;
+                    case '/': value.push_back('/'); break;
+                    case 'b': value.push_back('\b'); break;
+                    case 'f': value.push_back('\f'); break;
+                    case 'n': value.push_back('\n'); break;
+                    case 'r': value.push_back('\r'); break;
+                    case 't': value.push_back('\t'); break;
+                    default: value.push_back(ch); break;
+                    }
+                    escaped = false;
+                    continue;
+                }
+
+                if (ch == '\\') {
+                    escaped = true;
+                    continue;
+                }
+
+                if (ch == '"') {
+                    return value;
+                }
+
+                value.push_back(ch);
+            }
+
+            return "";
+        }
+
+        static bool ExtractJsonBool(const std::string& json, const std::string& key, bool defaultValue = false) {
+            std::string token = "\"" + key + "\"";
+            std::size_t keyPos = json.find(token);
+            if (keyPos == std::string::npos) {
+                return defaultValue;
+            }
+
+            std::size_t colonPos = json.find(':', keyPos + token.length());
+            if (colonPos == std::string::npos) {
+                return defaultValue;
+            }
+
+            std::size_t valuePos = json.find_first_not_of(" \t\r\n", colonPos + 1);
+            if (valuePos == std::string::npos) {
+                return defaultValue;
+            }
+
+            if (json.compare(valuePos, 4, "true") == 0) {
+                return true;
+            }
+
+            if (json.compare(valuePos, 5, "false") == 0) {
+                return false;
+            }
+
+            return defaultValue;
+        }
+
+        static std::string ExtractRawJsonObject(const std::string& json, const std::string& key) {
+            std::string token = "\"" + key + "\"";
+            std::size_t keyPos = json.find(token);
+            if (keyPos == std::string::npos) {
+                return "";
+            }
+
+            std::size_t colonPos = json.find(':', keyPos + token.length());
+            if (colonPos == std::string::npos) {
+                return "";
+            }
+
+            std::size_t start = json.find('{', colonPos + 1);
+            if (start == std::string::npos) {
+                return "";
+            }
+
+            int depth = 0;
+            bool inString = false;
+            bool escaped = false;
+
+            for (std::size_t i = start; i < json.size(); ++i) {
+                char ch = json[i];
+                if (inString) {
+                    if (escaped) {
+                        escaped = false;
+                    }
+                    else if (ch == '\\') {
+                        escaped = true;
+                    }
+                    else if (ch == '"') {
+                        inString = false;
+                    }
+                    continue;
+                }
+
+                if (ch == '"') {
+                    inString = true;
+                    continue;
+                }
+
+                if (ch == '{') {
+                    ++depth;
+                }
+                else if (ch == '}') {
+                    --depth;
+                    if (depth == 0) {
+                        return json.substr(start, i - start + 1);
+                    }
+                }
+            }
+
+            return "";
+        }
+
+        static std::map<std::string, std::string> ParseStringMap(const std::string& jsonObject) {
+            std::map<std::string, std::string> values;
+            if (jsonObject.empty()) {
+                return values;
+            }
+
+            std::size_t pos = 0;
+            while (true) {
+                std::size_t keyStart = jsonObject.find('"', pos);
+                if (keyStart == std::string::npos) {
+                    break;
+                }
+
+                std::size_t keyEnd = jsonObject.find('"', keyStart + 1);
+                if (keyEnd == std::string::npos) {
+                    break;
+                }
+
+                std::string key = jsonObject.substr(keyStart + 1, keyEnd - keyStart - 1);
+                std::size_t colonPos = jsonObject.find(':', keyEnd + 1);
+                if (colonPos == std::string::npos) {
+                    break;
+                }
+
+                std::size_t valueStart = jsonObject.find('"', colonPos + 1);
+                if (valueStart == std::string::npos) {
+                    break;
+                }
+
+                std::string value;
+                bool escaped = false;
+                for (std::size_t i = valueStart + 1; i < jsonObject.size(); ++i) {
+                    char ch = jsonObject[i];
+                    if (escaped) {
+                        switch (ch) {
+                        case '"': value.push_back('"'); break;
+                        case '\\': value.push_back('\\'); break;
+                        case 'n': value.push_back('\n'); break;
+                        case 'r': value.push_back('\r'); break;
+                        case 't': value.push_back('\t'); break;
+                        default: value.push_back(ch); break;
+                        }
+                        escaped = false;
+                        continue;
+                    }
+
+                    if (ch == '\\') {
+                        escaped = true;
+                        continue;
+                    }
+
+                    if (ch == '"') {
+                        pos = i + 1;
+                        values[key] = value;
+                        break;
+                    }
+
+                    value.push_back(ch);
+                }
+            }
+
+            return values;
+        }
+
+        static std::vector<BYTE> Base64ToBytes(std::string value) {
+            std::replace(value.begin(), value.end(), '-', '+');
+            std::replace(value.begin(), value.end(), '_', '/');
+            while (value.length() % 4 != 0) {
+                value.push_back('=');
+            }
+
+            DWORD needed = 0;
+            if (!CryptStringToBinaryA(value.c_str(), 0, CRYPT_STRING_BASE64, nullptr, &needed, nullptr, nullptr)) {
+                return {};
+            }
+
+            std::vector<BYTE> output(needed);
+            if (!CryptStringToBinaryA(value.c_str(), 0, CRYPT_STRING_BASE64, output.data(), &needed, nullptr, nullptr)) {
+                return {};
+            }
+
+            output.resize(needed);
+            return output;
+        }
 
         std::string GetHWID() {
             HANDLE hToken = nullptr;
-            if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken))
+            if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
                 return "HWID_FAIL";
+            }
 
             DWORD size = 0;
             GetTokenInformation(hToken, TokenUser, nullptr, 0, &size);
@@ -82,50 +452,225 @@ namespace TXA {
 
             LocalFree(sidString);
             CloseHandle(hToken);
-
             return sid;
         }
 
+        std::string BuildRequestJson(const std::map<std::string, std::string>& fields) const {
+            std::ostringstream json;
+            json << "{";
 
-        std::string HttpRequest(const std::string& endpoint, const std::string& jsonData) {
-            HINTERNET hInternet = InternetOpenA(
-                "TXA",
-                INTERNET_OPEN_TYPE_DIRECT,
-                NULL,
-                NULL,
-                0
-            );
-            if (!hInternet) return "";
+            bool first = true;
+            for (const auto& [key, value] : fields) {
+                if (!first) {
+                    json << ",";
+                }
+                first = false;
+                json << "\"" << JsonEscape(key) << "\":\"" << JsonEscape(value) << "\"";
+            }
+
+            json << "}";
+            return json.str();
+        }
+
+        RequestContext CreateRequest(const std::string& endpoint, const std::map<std::string, std::string>& fields) const {
+            RequestContext ctx;
+            ctx.Endpoint = endpoint;
+            ctx.Nonce = GenerateRandomHex();
+            ctx.Timestamp = std::to_string(CurrentUnixTimeSeconds());
+
+            auto payload = fields;
+            payload.emplace("clientNonce", ctx.Nonce);
+            payload.emplace("clientTimestamp", ctx.Timestamp);
+
+            ctx.JsonBody = BuildRequestJson(payload);
+            return ctx;
+        }
+
+        ApiResponse ParseResponse(const std::string& jsonStr) {
+            ApiResponse result;
+            result.Success = ExtractJsonBool(jsonStr, "success", false);
+            result.Message = ExtractJsonString(jsonStr, "message");
+            result.ServerVersion = ExtractJsonString(jsonStr, "serverVersion");
+            result.Username = ExtractJsonString(jsonStr, "username");
+            result.Subscription = ExtractJsonString(jsonStr, "subscription");
+            result.Expiry = ExtractJsonString(jsonStr, "expiry");
+            result.Value = ExtractJsonString(jsonStr, "value");
+            result.RequestNonce = ExtractJsonString(jsonStr, "requestNonce");
+            result.ServerTimestamp = ExtractJsonString(jsonStr, "serverTimestamp");
+            result.Signature = ExtractJsonString(jsonStr, "signature");
+            result.Variables = ParseStringMap(ExtractRawJsonObject(jsonStr, "variables"));
+            return result;
+        }
+
+        std::string BuildSignaturePayload(const RequestContext& request, const ApiResponse& response) const {
+            std::ostringstream variableStream;
+            for (const auto& [key, value] : response.Variables) {
+                variableStream << key << "=" << value << "\n";
+            }
+
+            std::ostringstream payload;
+            payload << "endpoint=" << Sha256Hex(request.Endpoint) << "\n";
+            payload << "requestNonce=" << Sha256Hex(request.Nonce) << "\n";
+            payload << "serverTimestamp=" << Sha256Hex(response.ServerTimestamp) << "\n";
+            payload << "success=" << (response.Success ? "1" : "0") << "\n";
+            payload << "message=" << Sha256Hex(response.Message) << "\n";
+            payload << "username=" << Sha256Hex(response.Username) << "\n";
+            payload << "subscription=" << Sha256Hex(response.Subscription) << "\n";
+            payload << "expiry=" << Sha256Hex(response.Expiry) << "\n";
+            payload << "serverVersion=" << Sha256Hex(response.ServerVersion) << "\n";
+            payload << "value=" << Sha256Hex(response.Value) << "\n";
+            payload << "variables=" << Sha256Hex(variableStream.str()) << "\n";
+            return payload.str();
+        }
+
+        bool VerifyResponseSignature(const RequestContext& request, const ApiResponse& response) const {
+            if (!EnforceStrictSecurity) {
+                return true;
+            }
+
+            if (ResponseSigningPublicKeyPem.empty()) {
+                return false;
+            }
+
+            if (response.RequestNonce.empty() || response.ServerTimestamp.empty() || response.Signature.empty()) {
+                return false;
+            }
+
+            if (response.RequestNonce != request.Nonce) {
+                return false;
+            }
+
+            long long now = CurrentUnixTimeSeconds();
+            long long serverTime = 0;
+            try {
+                serverTime = std::stoll(response.ServerTimestamp);
+            }
+            catch (...) {
+                return false;
+            }
+
+            if (std::llabs(now - serverTime) > AllowedClockSkewSeconds) {
+                return false;
+            }
+
+            std::vector<BYTE> signature = Base64ToBytes(response.Signature);
+            if (signature.empty()) {
+                return false;
+            }
+
+            std::string pem = ResponseSigningPublicKeyPem;
+            const std::string header = "-----BEGIN PUBLIC KEY-----";
+            const std::string footer = "-----END PUBLIC KEY-----";
+
+            std::size_t headerPos = pem.find(header);
+            std::size_t footerPos = pem.find(footer);
+            if (headerPos != std::string::npos && footerPos != std::string::npos) {
+                pem = pem.substr(headerPos + header.length(), footerPos - (headerPos + header.length()));
+            }
+
+            pem.erase(std::remove_if(pem.begin(), pem.end(), [](unsigned char c) {
+                return std::isspace(c) != 0;
+                }), pem.end());
+
+            std::vector<BYTE> publicKeyDer = Base64ToBytes(pem);
+            if (publicKeyDer.empty()) {
+                return false;
+            }
+
+            CERT_PUBLIC_KEY_INFO* publicKeyInfo = nullptr;
+            DWORD publicKeyInfoSize = 0;
+            if (!CryptDecodeObjectEx(
+                X509_ASN_ENCODING,
+                X509_PUBLIC_KEY_INFO,
+                publicKeyDer.data(),
+                static_cast<DWORD>(publicKeyDer.size()),
+                CRYPT_DECODE_ALLOC_FLAG,
+                nullptr,
+                &publicKeyInfo,
+                &publicKeyInfoSize)) {
+                return false;
+            }
+
+            BCRYPT_KEY_HANDLE keyHandle = nullptr;
+            bool verified = false;
+
+            if (CryptImportPublicKeyInfoEx2(X509_ASN_ENCODING, publicKeyInfo, 0, nullptr, &keyHandle)) {
+                BCRYPT_PKCS1_PADDING_INFO paddingInfo{ BCRYPT_SHA256_ALGORITHM };
+                std::string payload = BuildSignaturePayload(request, response);
+                std::string digestHex = Sha256Hex(payload);
+
+                std::vector<BYTE> digest;
+                digest.reserve(digestHex.length() / 2);
+                for (std::size_t i = 0; i + 1 < digestHex.length(); i += 2) {
+                    unsigned int byteValue = 0;
+                    std::stringstream stream;
+                    stream << std::hex << digestHex.substr(i, 2);
+                    stream >> byteValue;
+                    digest.push_back(static_cast<BYTE>(byteValue));
+                }
+
+                verified = BCryptVerifySignature(
+                    keyHandle,
+                    &paddingInfo,
+                    digest.data(),
+                    static_cast<ULONG>(digest.size()),
+                    signature.data(),
+                    static_cast<ULONG>(signature.size()),
+                    BCRYPT_PAD_PKCS1) == 0;
+            }
+
+            if (keyHandle) {
+                BCryptDestroyKey(keyHandle);
+            }
+
+            if (publicKeyInfo) {
+                LocalFree(publicKeyInfo);
+            }
+
+            return verified;
+        }
+
+        std::string HttpRequest(const RequestContext& request) {
+            HINTERNET hInternet = InternetOpenA("TXA", INTERNET_OPEN_TYPE_DIRECT, nullptr, nullptr, 0);
+            if (!hInternet) {
+                return "";
+            }
+
+            DWORD timeoutMs = 15000;
+            InternetSetOptionA(hInternet, INTERNET_OPTION_CONNECT_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
+            InternetSetOptionA(hInternet, INTERNET_OPTION_SEND_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
+            InternetSetOptionA(hInternet, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
 
             HINTERNET hConnect = InternetConnectA(
                 hInternet,
                 ApiHost.c_str(),
                 INTERNET_DEFAULT_HTTPS_PORT,
-                NULL,
-                NULL,
+                nullptr,
+                nullptr,
                 INTERNET_SERVICE_HTTP,
                 0,
-                0
-            );
+                0);
+
             if (!hConnect) {
                 InternetCloseHandle(hInternet);
                 return "";
             }
 
-            std::string path = "/" + endpoint;
-
+            std::string path = "/" + request.Endpoint;
             HINTERNET hRequest = HttpOpenRequestA(
                 hConnect,
                 "POST",
                 path.c_str(),
-                NULL,
-                NULL,
-                NULL,
+                nullptr,
+                nullptr,
+                nullptr,
                 INTERNET_FLAG_SECURE |
                 INTERNET_FLAG_RELOAD |
-                INTERNET_FLAG_NO_CACHE_WRITE,
-                0
-            );
+                INTERNET_FLAG_NO_CACHE_WRITE |
+                INTERNET_FLAG_NO_AUTO_REDIRECT |
+                INTERNET_FLAG_NO_COOKIES,
+                0);
+
             if (!hRequest) {
                 InternetCloseHandle(hConnect);
                 InternetCloseHandle(hInternet);
@@ -134,20 +679,21 @@ namespace TXA {
 
             std::string headers =
                 "Content-Type: application/json\r\n"
-                "Accept: application/json\r\n";
+                "Accept: application/json\r\n"
+                "X-TXA-Nonce: " + request.Nonce + "\r\n"
+                "X-TXA-Timestamp: " + request.Timestamp + "\r\n";
 
             BOOL sent = HttpSendRequestA(
                 hRequest,
                 headers.c_str(),
-                (DWORD)headers.length(),
-                (LPVOID)jsonData.c_str(),
-                (DWORD)jsonData.length()
-            );
+                static_cast<DWORD>(headers.length()),
+                reinterpret_cast<LPVOID>(const_cast<char*>(request.JsonBody.data())),
+                static_cast<DWORD>(request.JsonBody.length()));
 
             std::string response;
             if (sent) {
                 char buffer[4096];
-                DWORD bytesRead;
+                DWORD bytesRead = 0;
                 while (InternetReadFile(hRequest, buffer, sizeof(buffer) - 1, &bytesRead) && bytesRead) {
                     buffer[bytesRead] = 0;
                     response += buffer;
@@ -161,95 +707,36 @@ namespace TXA {
             return response;
         }
 
-        ApiResponse ParseResponse(const std::string& jsonStr) {
-            ApiResponse result{ false, "", {} };
-
-            // success
-            if (jsonStr.find("\"success\":true") != std::string::npos)
-                result.Success = true;
-
-            // message
-            size_t msgPos = jsonStr.find("\"message\"");
-            if (msgPos != std::string::npos) {
-                size_t start = jsonStr.find("\"", msgPos + 9) + 1;
-                size_t end = jsonStr.find("\"", start);
-                result.Message = jsonStr.substr(start, end - start);
+        ApiResponse PerformSecureRequest(const RequestContext& request) {
+            std::string rawResponse = HttpRequest(request);
+            if (rawResponse.empty()) {
+                throw std::runtime_error(TamperDetectedMessage());
             }
 
-            // serverVersion (IMPORTANT FIX)
-            size_t verPos = jsonStr.find("\"serverVersion\"");
-            if (verPos != std::string::npos) {
-                size_t start = jsonStr.find("\"", verPos + 15) + 1;
-                size_t end = jsonStr.find("\"", start);
-                result.Data["serverVersion"] = jsonStr.substr(start, end - start);
+            ApiResponse response = ParseResponse(rawResponse);
+            if (!VerifyResponseSignature(request, response)) {
+                throw std::runtime_error(TamperDetectedMessage());
             }
 
-            // username
-            size_t userPos = jsonStr.find("\"username\"");
-            if (userPos != std::string::npos) {
-                size_t start = jsonStr.find("\"", userPos + 10) + 1;
-                size_t end = jsonStr.find("\"", start);
-                result.Data["username"] = jsonStr.substr(start, end - start);
-            }
-
-            // subscription
-            size_t subPos = jsonStr.find("\"subscription\"");
-            if (subPos != std::string::npos) {
-                size_t start = jsonStr.find("\"", subPos + 14) + 1;
-                size_t end = jsonStr.find("\"", start);
-                result.Data["subscription"] = jsonStr.substr(start, end - start);
-            }
-
-            // expiry
-            size_t expPos = jsonStr.find("\"expiry\"");
-            if (expPos != std::string::npos) {
-                size_t start = jsonStr.find("\"", expPos + 8) + 1;
-                size_t end = jsonStr.find("\"", start);
-                result.Data["expiry"] = jsonStr.substr(start, end - start);
-            }
-            // variable
-            size_t varsPos = jsonStr.find("\"variables\"");
-            if (varsPos != std::string::npos) {
-                size_t start = jsonStr.find("{", varsPos);
-                size_t end = jsonStr.find("}", start);
-
-                if (start != std::string::npos && end != std::string::npos) {
-                    std::string varsBlock = jsonStr.substr(start + 1, end - start - 1);
-
-                    size_t pos = 0;
-                    while ((pos = varsBlock.find("\"", pos)) != std::string::npos) {
-                        size_t keyEnd = varsBlock.find("\"", pos + 1);
-                        std::string key = varsBlock.substr(pos + 1, keyEnd - pos - 1);
-
-                        size_t valStart = varsBlock.find("\"", keyEnd + 1);
-                        size_t valEnd = varsBlock.find("\"", valStart + 1);
-                        std::string value = varsBlock.substr(valStart + 1, valEnd - valStart - 1);
-
-                        result.Data[key] = value;
-                        pos = valEnd + 1;
-                    }
-                }
-            }
-            return result;
+            return response;
         }
-
 
         void ShowError(const std::string& title, const std::string& message) {
             AllocConsole();
             HANDLE hConsole = GetStdHandle(STD_OUTPUT_HANDLE);
 
             SetConsoleTextAttribute(hConsole, 12);
-            std::cout << "\n?" << std::string(70, '=') << "?\n";
-            std::cout << "? " << std::left << std::setw(69) << title << " ?\n";
-            std::cout << "?" << std::string(70, '=') << "?\n";
+            std::cout << "\n[" << std::string(70, '=') << "]\n";
+            std::cout << "[ " << std::left << std::setw(69) << title << " ]\n";
+            std::cout << "[" << std::string(70, '=') << "]\n";
 
             std::istringstream iss(message);
             std::string line;
             while (std::getline(iss, line)) {
-                std::cout << "? " << std::left << std::setw(69) << line << " ?\n";
+                std::cout << "[ " << std::left << std::setw(69) << line << " ]\n";
             }
 
-            std::cout << "?" << std::string(70, '=') << "?\n";
+            std::cout << "[" << std::string(70, '=') << "]\n";
             SetConsoleTextAttribute(hConsole, 7);
             std::cout << "\nPress any key to exit...";
             std::cin.get();
@@ -258,47 +745,59 @@ namespace TXA {
         }
 
         bool CheckIfPaused() {
-            std::string json = "{\"secret\":\"" + Secret + "\",\"appName\":\"" + AppName + "\"}";
-            std::string response = HttpRequest("isapplicationpaused", json);
-            ApiResponse result = ParseResponse(response);
+            RequestContext request = CreateRequest("isapplicationpaused", {
+                {"secret", Secret},
+                {"appName", AppName}
+                });
+
+            ApiResponse result = PerformSecureRequest(request);
             return result.Success && result.Message == "APPLICATION_PAUSED";
         }
 
         std::pair<bool, std::string> CheckVersion() {
-            std::string json = "{\"secret\":\"" + Secret + "\",\"appName\":\"" + AppName + "\",\"appVersion\":\"" + Version + "\"}";
-            std::string response = HttpRequest("versioncheck", json);
-            ApiResponse result = ParseResponse(response);
+            RequestContext request = CreateRequest("versioncheck", {
+                {"secret", Secret},
+                {"appName", AppName},
+                {"appVersion", Version}
+                });
 
-            if (result.Success) {
-                if (result.Message == "VERSION_OK") {
-                    return { true, Version };
-                }
-                else if (result.Message == "VERSION_MISMATCH") {
-                    auto it = result.Data.find("serverVersion");
-                    if (it != result.Data.end()) {
-                        return { false, it->second };
-                    }
-                    return { false, "Unknown" };
-                }
+            ApiResponse result = PerformSecureRequest(request);
+            if (result.Success && result.Message == "VERSION_OK") {
+                return { true, Version };
             }
+
+            if (result.Message == "VERSION_MISMATCH" && !result.ServerVersion.empty()) {
+                return { false, result.ServerVersion };
+            }
+
             return { false, "Unknown" };
         }
 
         bool LoadAppVariables() {
-            std::string json = "{\"secret\":\"" + Secret + "\",\"appName\":\"" + AppName + "\"}";
-            std::string response = HttpRequest("getvariables", json);
-            ApiResponse result = ParseResponse(response);
+            RequestContext request = CreateRequest("getvariables", {
+                {"secret", Secret},
+                {"appName", AppName}
+                });
 
-            if (result.Success && result.Message != "NO_VARIABLES") {
-                std::lock_guard<std::mutex> lock(varMutex);
-                Variables.clear();
-
-                for (const auto& pair : result.Data) {
-                    Variables[pair.first] = pair.second;
-                }
-                return true;
+            ApiResponse result = PerformSecureRequest(request);
+            if (!result.Success || result.Message == "NO_VARIABLES") {
+                return false;
             }
-            return false;
+
+            std::lock_guard<std::mutex> lock(varMutex);
+            Variables = result.Variables;
+            return true;
+        }
+
+        void EnsureSecurityConfiguration() {
+            if (!EnforceStrictSecurity) {
+                return;
+            }
+
+            if (ResponseSigningPublicKeyPem.empty()) {
+                ShowError(_xor_("Security Alert").str(), TamperDetectedMessage());
+                ExitProcess(0);
+            }
         }
 
     public:
@@ -306,11 +805,56 @@ namespace TXA {
             : AppName(name), Secret(secret), Version(version) {
         }
 
+        void SetResponseSigningPublicKeyPem(const std::string& pem) {
+            ResponseSigningPublicKeyPem = TrimCopy(pem);
+        }
+
+        bool SetResponseSigningPublicKeyFromFile(const std::string& path) {
+            std::ifstream file(path, std::ios::in | std::ios::binary);
+            if (!file.is_open()) {
+                return false;
+            }
+
+            std::ostringstream buffer;
+            buffer << file.rdbuf();
+            ResponseSigningPublicKeyPem = TrimCopy(buffer.str());
+            return !ResponseSigningPublicKeyPem.empty();
+        }
+
+        bool LoadResponseSigningPublicKeyFromEnvironment(const std::string& envVar = "TXA_RESPONSE_SIGNING_PUBLIC_KEY_PEM") {
+            char* value = nullptr;
+            std::size_t size = 0;
+            if (_dupenv_s(&value, &size, envVar.c_str()) != 0 || !value || size == 0) {
+                if (value) {
+                    free(value);
+                }
+                return false;
+            }
+
+            ResponseSigningPublicKeyPem = TrimCopy(std::string(value));
+            free(value);
+            return !ResponseSigningPublicKeyPem.empty();
+        }
+
+        bool HasResponseSigningPublicKey() const {
+            return !ResponseSigningPublicKeyPem.empty();
+        }
+
+        void SetStrictSecurity(bool enabled) {
+            EnforceStrictSecurity = enabled;
+        }
+
+        void SetAllowedClockSkewSeconds(long long seconds) {
+            AllowedClockSkewSeconds = seconds > 0 ? seconds : 120;
+        }
+
         void Init() {
             if (AppName.empty() || Secret.empty() || Version.empty()) {
                 ShowError("TXA Auth Error", "AppName/Secret/Version missing");
                 ExitProcess(0);
             }
+
+            EnsureSecurityConfiguration();
 
             std::thread([this]() {
                 try {
@@ -335,12 +879,14 @@ namespace TXA {
 
                     LoadAppVariables();
                     IsInitialized = true;
-
-                    std::lock_guard<std::mutex> lock(responseMutex);
-                    ResponseMessage = "TXA SDK Initialized successfully!";
+                    SetResponseMessage("TXA SDK initialized with signed-response verification.");
+                }
+                catch (const std::exception& ex) {
+                    ShowError(_xor_("Security Alert").str(), TamperDetectedMessage());
+                    ExitProcess(0);
                 }
                 catch (...) {
-                    ShowError("Init Error", "Initialization failed");
+                    ShowError(_xor_("Security Alert").str(), TamperDetectedMessage());
                     ExitProcess(0);
                 }
                 }).detach();
@@ -356,72 +902,47 @@ namespace TXA {
             LoginResult result{ false, "", {} };
 
             if (!IsInitialized) {
-                ResponseMessage = "Error: Call TXA.Init() first";
-                result.Message = ResponseMessage;
+                SetResponseMessage("Error: Call TXA.Init() first");
+                result.Message = Response();
                 return result;
             }
 
             try {
-                std::string hwid = GetHWID();
-                std::string json = "{\"username\":\"" + username +
-                    "\",\"password\":\"" + password +
-                    "\",\"secret\":\"" + Secret +
-                    "\",\"appName\":\"" + AppName +
-                    "\",\"appVersion\":\"" + Version +
-                    "\",\"hwid\":\"" + hwid + "\"}";
+                RequestContext request = CreateRequest("login", {
+                    {"username", username},
+                    {"password", password},
+                    {"secret", Secret},
+                    {"appName", AppName},
+                    {"appVersion", Version},
+                    {"hwid", GetHWID()}
+                    });
 
-                std::string response = HttpRequest("login", json);
-                ApiResponse apiResp = ParseResponse(response);
-
-                if (apiResp.Success) {
-                    IsLoggedIn = true;
-
-                    CurrentUser.Username = apiResp.Data.count("username") ? apiResp.Data["username"] : "";
-                    CurrentUser.Subscription = apiResp.Data.count("subscription") ? apiResp.Data["subscription"] : "";
-                    CurrentUser.Expiry = apiResp.Data.count("expiry") ? apiResp.Data["expiry"] : "";
-
-                    ResponseMessage = "Login successful! Welcome, " + CurrentUser.Username;
-
-                    result.Success = true;
-                    result.Message = ResponseMessage;
-                    result.User = CurrentUser;
+                ApiResponse apiResp = PerformSecureRequest(request);
+                if (!apiResp.Success) {
+                    SetResponseMessage(apiResp.Message.empty() ? "Login failed" : apiResp.Message);
+                    result.Message = Response();
                     return result;
                 }
-                else {
-                    std::string error = apiResp.Message;
-                    std::string formatted;
 
-                    if (error.find("INVALID_CREDENTIALS") != std::string::npos ||
-                        error.find("Invalid username or password") != std::string::npos) {
-                        formatted = "Invalid username or password";
-                    }
-                    else if (error.find("HWID_RESET") != std::string::npos ||
-                        error.find("HWID_MISMATCH") != std::string::npos) {
-                        formatted = "HWID mismatch. Please contact support to reset your HWID";
-                    }
-                    else if (error.find("BANNED") != std::string::npos ||
-                        error.find("suspended") != std::string::npos) {
-                        formatted = "Account has been banned or suspended";
-                    }
-                    else if (error.find("expired") != std::string::npos ||
-                        error.find("EXPIRED") != std::string::npos) {
-                        formatted = "Subscription has expired";
-                    }
-                    else if (error.find("MAX_DEVICES") != std::string::npos) {
-                        formatted = "Maximum number of devices reached";
-                    }
-                    else {
-                        formatted = "Login failed: " + error;
-                    }
+                IsLoggedIn = true;
+                CurrentUser.Username = apiResp.Username;
+                CurrentUser.Subscription = apiResp.Subscription;
+                CurrentUser.Expiry = apiResp.Expiry;
 
-                    ResponseMessage = formatted;
-                    result.Message = formatted;
-                    return result;
-                }
+                SetResponseMessage("Login successful! Welcome, " + CurrentUser.Username);
+                result.Success = true;
+                result.Message = Response();
+                result.User = CurrentUser;
+                return result;
+            }
+            catch (const std::exception& ex) {
+                SetResponseMessage(TamperDetectedMessage());
+                result.Message = Response();
+                return result;
             }
             catch (...) {
-                ResponseMessage = "Connection error";
-                result.Message = ResponseMessage;
+                SetResponseMessage("Connection error");
+                result.Message = Response();
                 return result;
             }
         }
@@ -435,64 +956,42 @@ namespace TXA {
             RegisterResult result{ false, "" };
 
             if (!IsInitialized) {
-                ResponseMessage = "Error: Call TXA.Init() first";
-                result.Message = ResponseMessage;
+                SetResponseMessage("Error: Call TXA.Init() first");
+                result.Message = Response();
                 return result;
             }
 
             try {
-                std::string hwid = GetHWID();
-                std::string json = "{\"username\":\"" + username +
-                    "\",\"password\":\"" + password +
-                    "\",\"licenseKey\":\"" + license +
-                    "\",\"secret\":\"" + Secret +
-                    "\",\"appName\":\"" + AppName +
-                    "\",\"appVersion\":\"" + Version +
-                    "\",\"hwid\":\"" + hwid + "\"}";
+                RequestContext request = CreateRequest("register", {
+                    {"username", username},
+                    {"password", password},
+                    {"licenseKey", license},
+                    {"secret", Secret},
+                    {"appName", AppName},
+                    {"appVersion", Version},
+                    {"hwid", GetHWID()}
+                    });
 
-                std::string response = HttpRequest("register", json);
-                ApiResponse apiResp = ParseResponse(response);
-
-                if (apiResp.Success) {
-                    ResponseMessage = "Registration successful! You can login now";
-                    result.Success = true;
-                    result.Message = ResponseMessage;
+                ApiResponse apiResp = PerformSecureRequest(request);
+                if (!apiResp.Success) {
+                    SetResponseMessage(apiResp.Message.empty() ? "Registration failed" : apiResp.Message);
+                    result.Message = Response();
                     return result;
                 }
-                else {
-                    std::string error = apiResp.Message;
-                    std::string formatted;
 
-                    if (error.find("INVALID_LICENSE") != std::string::npos) {
-                        formatted = "Invalid license key";
-                    }
-                    else if (error.find("USERNAME_TAKEN") != std::string::npos) {
-                        formatted = "Username is already taken";
-                    }
-                    else if (error.find("LICENSE_USED") != std::string::npos) {
-                        formatted = "License key has already been used";
-                    }
-                    else if (error.find("LICENSE_EXPIRED") != std::string::npos) {
-                        formatted = "License key has expired";
-                    }
-                    else if (error.find("WEAK_PASSWORD") != std::string::npos) {
-                        formatted = "Password is too weak. Please use a stronger password";
-                    }
-                    else if (error.find("INVALID_USERNAME") != std::string::npos) {
-                        formatted = "Invalid username format";
-                    }
-                    else {
-                        formatted = "Registration failed: " + error;
-                    }
-
-                    ResponseMessage = formatted;
-                    result.Message = formatted;
-                    return result;
-                }
+                SetResponseMessage("Registration successful! You can login now.");
+                result.Success = true;
+                result.Message = Response();
+                return result;
+            }
+            catch (const std::exception& ex) {
+                SetResponseMessage(TamperDetectedMessage());
+                result.Message = Response();
+                return result;
             }
             catch (...) {
-                ResponseMessage = "Connection error";
-                result.Message = ResponseMessage;
+                SetResponseMessage("Connection error");
+                result.Message = Response();
                 return result;
             }
         }
@@ -500,20 +999,21 @@ namespace TXA {
         std::string Var(const std::string& name) {
             std::lock_guard<std::mutex> lock(varMutex);
             auto it = Variables.find(name);
-            if (it != Variables.end()) {
-                return it->second;
-            }
-            return "VARIABLE_NOT_FOUND";
+            return it != Variables.end() ? it->second : "VARIABLE_NOT_FOUND";
         }
 
         template<typename T>
         T Get(const std::string& name) {
             std::string value = Var(name);
-            if (value == "VARIABLE_NOT_FOUND") return T();
+            if (value == "VARIABLE_NOT_FOUND") {
+                return T();
+            }
 
             if constexpr (std::is_same_v<T, bool>) {
                 std::string lower = value;
-                std::transform(lower.begin(), lower.end(), lower.begin(), ::tolower);
+                std::transform(lower.begin(), lower.end(), lower.begin(), [](unsigned char c) {
+                    return static_cast<char>(std::tolower(c));
+                    });
                 return lower == "true" || lower == "1";
             }
             else if constexpr (std::is_same_v<T, int>) {
@@ -532,66 +1032,74 @@ namespace TXA {
 
         std::string GetVariable(const std::string& name) {
             if (!IsInitialized) {
-                ResponseMessage = "Error: Call TXA.Init() first";
+                SetResponseMessage("Error: Call TXA.Init() first");
                 return "";
             }
 
             std::string cached = Var(name);
             if (cached != "VARIABLE_NOT_FOUND") {
-                ResponseMessage = "Variable '" + name + "' retrieved from cache";
+                SetResponseMessage("Variable '" + name + "' retrieved from cache");
                 return cached;
             }
 
             try {
-                std::string json = "{\"secret\":\"" + Secret +
-                    "\",\"appName\":\"" + AppName +
-                    "\",\"appVersion\":\"" + Version +
-                    "\",\"varName\":\"" + name + "\"}";
+                RequestContext request = CreateRequest("getvariable", {
+                    {"secret", Secret},
+                    {"appName", AppName},
+                    {"appVersion", Version},
+                    {"varName", name}
+                    });
 
-                std::string response = HttpRequest("getvariable", json);
-                ApiResponse apiResp = ParseResponse(response);
-
-                if (apiResp.Success) {
-                    auto it = apiResp.Data.find("value");
-                    if (it != apiResp.Data.end()) {
-                        std::lock_guard<std::mutex> lock(varMutex);
-                        Variables[name] = it->second;
-                        ResponseMessage = "Variable '" + name + "' retrieved successfully";
-                        return it->second;
-                    }
-                    ResponseMessage = "Variable '" + name + "' not found";
+                ApiResponse apiResp = PerformSecureRequest(request);
+                if (!apiResp.Success) {
+                    SetResponseMessage("Failed to get variable '" + name + "': " + apiResp.Message);
                     return "";
                 }
-                else {
-                    ResponseMessage = "Failed to get variable '" + name + "': " + apiResp.Message;
+
+                if (apiResp.Value.empty()) {
+                    SetResponseMessage("Variable '" + name + "' not found");
                     return "";
                 }
+
+                {
+                    std::lock_guard<std::mutex> lock(varMutex);
+                    Variables[name] = apiResp.Value;
+                }
+
+                SetResponseMessage("Variable '" + name + "' retrieved successfully");
+                return apiResp.Value;
+            }
+            catch (const std::exception& ex) {
+                SetResponseMessage(TamperDetectedMessage());
+                return "";
             }
             catch (...) {
-                ResponseMessage = "Connection error";
+                SetResponseMessage("Connection error");
                 return "";
             }
         }
 
         bool RefreshVariables() {
             if (!IsInitialized) {
-                ResponseMessage = "Error: Call TXA.Init() first";
+                SetResponseMessage("Error: Call TXA.Init() first");
                 return false;
             }
 
             try {
-                bool result = LoadAppVariables();
-                if (result) {
-                    ResponseMessage = "Successfully refreshed " + std::to_string(Variables.size()) + " variables";
-                    return true;
-                }
-                else {
-                    ResponseMessage = "No variables found or failed to load";
+                if (!LoadAppVariables()) {
+                    SetResponseMessage("No variables found or failed to load");
                     return false;
                 }
+
+                SetResponseMessage("Successfully refreshed " + std::to_string(Variables.size()) + " variables");
+                return true;
+            }
+            catch (const std::exception& ex) {
+                SetResponseMessage(TamperDetectedMessage());
+                return false;
             }
             catch (...) {
-                ResponseMessage = "Failed to refresh variables";
+                SetResponseMessage("Failed to refresh variables");
                 return false;
             }
         }
@@ -612,5 +1120,4 @@ namespace TXA {
         bool VersionOk() { return IsVersionCorrect; }
         std::string ServerVer() { return ServerVersion; }
     };
-
 }

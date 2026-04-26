@@ -4,7 +4,7 @@
 #include <chrono>
 
 int main() {
-    TXA::Auth txa("", "", "1.0");
+    TXA::Auth txa("test", "TXA-ZKOM4LP9DA", "1.0");
 
     txa.Init();
 
