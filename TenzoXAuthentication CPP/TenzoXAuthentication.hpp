@@ -1,9 +1,8 @@
 #pragma once
 
 #include <windows.h>
-#include <wininet.h>
+#include <winhttp.h>
 #include <wincrypt.h>
-#include <bcrypt.h>
 #include <iphlpapi.h>
 #include <iostream>
 #include <string>
@@ -14,34 +13,16 @@
 #include <atomic>
 #include <sstream>
 #include <iomanip>
-#include <ctime>
 #include <algorithm>
-#include <random>
 #include <cctype>
 #include <cstdlib>
 #include <stdexcept>
-#include <fstream>
 #include <sddl.h>
 #include "xorstr.hpp"
 
-#pragma comment(lib, "wininet.lib")
+#pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "crypt32.lib")
-#pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "iphlpapi.lib")
-
-#ifndef TXA_RESPONSE_SIGNING_PUBLIC_KEY_PEM
-#define TXA_RESPONSE_SIGNING_PUBLIC_KEY_PEM R"(-----BEGIN PUBLIC KEY-----
-MIIBojANBgkqhkiG9w0BAQEFAAOCAY8AMIIBigKCAYEAh3fjJEqt8/GbGNkhn9ws
-8v7cStTdgEv2712vsJUhyJXS/hhG6wLcTHCk/hY/+jICvAF7lsSAMmz4Nwntp62B
-cPj+OP6eWcX4WSSciK0O+i1qiF0QxXEFchvQCcUa3GVxrDLKFPB5/44ct+INqUV5
-dZZYhZl39zQcs+2zvY3kJGvOafopGhsuedMh7eLkPP09lUAXnX30yOyU4G71MXut
-mKo1V8M3F4O7G91s6bZLhxONOU6NhgSuykCM2u3hzP34nXC4uJe0Lx/8ENftWNwZ
-3Qf3cuXcXCZJsWSzEhfYSZX5waQOUoE5qqqslygoCt40lCP7qk1Z9drP9C9losxy
-f1vHTTismKkTnVHSZJRXu1wtYC79J8F3f8oG97uwo3p+p1LA+CdF1X69xSY0nFZu
-QF1qxkOV4NUrcOXra+blw8FaowKahBBzjJeAzjoTa02DxexQSk2kDVvPmUrOv68U
-L/i6HsvOzaC62R7mNOKiqaDB9bircvGj/BknhX5Etf5RAgMBAAE=
------END PUBLIC KEY-----)"
-#endif
 
 namespace TXA {
 
@@ -62,23 +43,14 @@ namespace TXA {
             std::string Subscription;
             std::string Expiry;
             std::string Value;
-            std::string RequestNonce;
-            std::string ServerTimestamp;
-            std::string Signature;
             std::map<std::string, std::string> Variables;
-        };
-
-        struct RequestContext {
-            std::string Endpoint;
-            std::string JsonBody;
-            std::string Nonce;
-            std::string Timestamp;
         };
 
         std::string AppName;
         std::string Secret;
         std::string Version;
         std::string ApiHost = "tenxoxauthentication.qzz.io";
+        std::string PinnedCertSha256 = "DB:42:42:C4:90:3E:47:7D:F2:76:29:33:7C:68:EA:BA:B5:31:28:CA:2B:C4:EB:48:2B:40:79:00:C9:4D:95:ED";
 
         std::atomic<bool> IsInitialized{ false };
         std::atomic<bool> IsLoggedIn{ false };
@@ -90,15 +62,29 @@ namespace TXA {
         UserData CurrentUser;
         std::map<std::string, std::string> Variables;
 
-        std::string ResponseSigningPublicKeyPem = TXA_RESPONSE_SIGNING_PUBLIC_KEY_PEM;
-        long long AllowedClockSkewSeconds = 120;
-        bool EnforceStrictSecurity = true;
-
         std::mutex varMutex;
         std::mutex responseMutex;
 
         static std::string TamperDetectedMessage() {
             return _xor_("Tamper detected. Access blocked.").str();
+        }
+
+        static std::wstring Utf8ToWide(const std::string& value) {
+            if (value.empty()) {
+                return std::wstring();
+            }
+
+            int needed = MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, nullptr, 0);
+            if (needed <= 0) {
+                throw std::runtime_error("Failed to convert string");
+            }
+
+            std::wstring result(static_cast<std::size_t>(needed) - 1, L'\0');
+            if (MultiByteToWideChar(CP_UTF8, 0, value.c_str(), -1, result.data(), needed) <= 0) {
+                throw std::runtime_error("Failed to convert string");
+            }
+
+            return result;
         }
 
         void SetResponseMessage(const std::string& message) {
@@ -130,79 +116,6 @@ namespace TXA {
                 }
             }
             return out.str();
-        }
-
-        static long long CurrentUnixTimeSeconds() {
-            return static_cast<long long>(std::time(nullptr));
-        }
-
-        static std::string TrimCopy(std::string value) {
-            auto notSpace = [](unsigned char c) { return !std::isspace(c); };
-            value.erase(value.begin(), std::find_if(value.begin(), value.end(), notSpace));
-            value.erase(std::find_if(value.rbegin(), value.rend(), notSpace).base(), value.end());
-            return value;
-        }
-
-        static std::string GenerateRandomHex(std::size_t byteCount = 16) {
-            std::vector<unsigned char> bytes(byteCount);
-            if (BCryptGenRandom(nullptr, bytes.data(), static_cast<ULONG>(bytes.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0) {
-                throw std::runtime_error("Failed to generate secure random bytes");
-            }
-
-            static const char* hex = "0123456789ABCDEF";
-            std::string output;
-            output.reserve(byteCount * 2);
-
-            for (unsigned char byte : bytes) {
-                output.push_back(hex[(byte >> 4) & 0x0F]);
-                output.push_back(hex[byte & 0x0F]);
-            }
-
-            return output;
-        }
-
-        static std::string BytesToHexUpper(const BYTE* bytes, DWORD length) {
-            std::ostringstream out;
-            out << std::uppercase << std::hex << std::setfill('0');
-            for (DWORD i = 0; i < length; ++i) {
-                out << std::setw(2) << static_cast<int>(bytes[i]);
-            }
-            return out.str();
-        }
-
-        static std::string Sha256Hex(const std::string& data) {
-            BCRYPT_ALG_HANDLE algHandle = nullptr;
-            BCRYPT_HASH_HANDLE hashHandle = nullptr;
-            DWORD objectLength = 0;
-            DWORD resultLength = 0;
-            DWORD hashLength = 0;
-
-            if (BCryptOpenAlgorithmProvider(&algHandle, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0) {
-                throw std::runtime_error("Failed to open SHA-256 provider");
-            }
-
-            if (BCryptGetProperty(algHandle, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&objectLength), sizeof(objectLength), &resultLength, 0) != 0 ||
-                BCryptGetProperty(algHandle, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hashLength), sizeof(hashLength), &resultLength, 0) != 0) {
-                BCryptCloseAlgorithmProvider(algHandle, 0);
-                throw std::runtime_error("Failed to query SHA-256 properties");
-            }
-
-            std::vector<BYTE> hashObject(objectLength);
-            std::vector<BYTE> hashBytes(hashLength);
-
-            if (BCryptCreateHash(algHandle, &hashHandle, hashObject.data(), objectLength, nullptr, 0, 0) != 0 ||
-                BCryptHashData(hashHandle, reinterpret_cast<PUCHAR>(const_cast<char*>(data.data())), static_cast<ULONG>(data.size()), 0) != 0 ||
-                BCryptFinishHash(hashHandle, hashBytes.data(), hashLength, 0) != 0) {
-                if (hashHandle) {
-                    BCryptDestroyHash(hashHandle);
-                }
-                BCryptCloseAlgorithmProvider(algHandle, 0);
-                throw std::runtime_error("Failed to hash data");
-            }
-
-            BCryptDestroyHash(hashHandle);
-            BCryptCloseAlgorithmProvider(algHandle, 0);
-            return BytesToHexUpper(hashBytes.data(), hashLength);
         }
 
         static std::string ExtractJsonString(const std::string& json, const std::string& key) {
@@ -404,25 +317,28 @@ namespace TXA {
             return values;
         }
 
-        static std::vector<BYTE> Base64ToBytes(std::string value) {
-            std::replace(value.begin(), value.end(), '-', '+');
-            std::replace(value.begin(), value.end(), '_', '/');
-            while (value.length() % 4 != 0) {
-                value.push_back('=');
+        static std::string BytesToFingerprint(const BYTE* bytes, DWORD length) {
+            std::ostringstream out;
+            out << std::uppercase << std::hex << std::setfill('0');
+            for (DWORD i = 0; i < length; ++i) {
+                if (i > 0) {
+                    out << ":";
+                }
+                out << std::setw(2) << static_cast<int>(bytes[i]);
             }
+            return out.str();
+        }
 
-            DWORD needed = 0;
-            if (!CryptStringToBinaryA(value.c_str(), 0, CRYPT_STRING_BASE64, nullptr, &needed, nullptr, nullptr)) {
-                return {};
-            }
+        static std::string NormalizeFingerprint(std::string value) {
+            value.erase(std::remove_if(value.begin(), value.end(), [](unsigned char c) {
+                return std::isspace(c) != 0;
+            }), value.end());
 
-            std::vector<BYTE> output(needed);
-            if (!CryptStringToBinaryA(value.c_str(), 0, CRYPT_STRING_BASE64, output.data(), &needed, nullptr, nullptr)) {
-                return {};
-            }
+            std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+                return static_cast<char>(std::toupper(c));
+            });
 
-            output.resize(needed);
-            return output;
+            return value;
         }
 
         std::string GetHWID() {
@@ -472,20 +388,6 @@ namespace TXA {
             return json.str();
         }
 
-        RequestContext CreateRequest(const std::string& endpoint, const std::map<std::string, std::string>& fields) const {
-            RequestContext ctx;
-            ctx.Endpoint = endpoint;
-            ctx.Nonce = GenerateRandomHex();
-            ctx.Timestamp = std::to_string(CurrentUnixTimeSeconds());
-
-            auto payload = fields;
-            payload.emplace("clientNonce", ctx.Nonce);
-            payload.emplace("clientTimestamp", ctx.Timestamp);
-
-            ctx.JsonBody = BuildRequestJson(payload);
-            return ctx;
-        }
-
         ApiResponse ParseResponse(const std::string& jsonStr) {
             ApiResponse result;
             result.Success = ExtractJsonBool(jsonStr, "success", false);
@@ -495,230 +397,120 @@ namespace TXA {
             result.Subscription = ExtractJsonString(jsonStr, "subscription");
             result.Expiry = ExtractJsonString(jsonStr, "expiry");
             result.Value = ExtractJsonString(jsonStr, "value");
-            result.RequestNonce = ExtractJsonString(jsonStr, "requestNonce");
-            result.ServerTimestamp = ExtractJsonString(jsonStr, "serverTimestamp");
-            result.Signature = ExtractJsonString(jsonStr, "signature");
             result.Variables = ParseStringMap(ExtractRawJsonObject(jsonStr, "variables"));
             return result;
         }
+        void VerifyPinnedCertificate(HINTERNET hRequest) const {
+            PCCERT_CONTEXT certContext = nullptr;
+            DWORD certContextSize = sizeof(certContext);
 
-        std::string BuildSignaturePayload(const RequestContext& request, const ApiResponse& response) const {
-            std::ostringstream variableStream;
-            for (const auto& [key, value] : response.Variables) {
-                variableStream << key << "=" << value << "\n";
+            if (!WinHttpQueryOption(hRequest, WINHTTP_OPTION_SERVER_CERT_CONTEXT, &certContext, &certContextSize) || !certContext) {
+                throw std::runtime_error(TamperDetectedMessage());
             }
 
-            std::ostringstream payload;
-            payload << "endpoint=" << Sha256Hex(request.Endpoint) << "\n";
-            payload << "requestNonce=" << Sha256Hex(request.Nonce) << "\n";
-            payload << "serverTimestamp=" << Sha256Hex(response.ServerTimestamp) << "\n";
-            payload << "success=" << (response.Success ? "1" : "0") << "\n";
-            payload << "message=" << Sha256Hex(response.Message) << "\n";
-            payload << "username=" << Sha256Hex(response.Username) << "\n";
-            payload << "subscription=" << Sha256Hex(response.Subscription) << "\n";
-            payload << "expiry=" << Sha256Hex(response.Expiry) << "\n";
-            payload << "serverVersion=" << Sha256Hex(response.ServerVersion) << "\n";
-            payload << "value=" << Sha256Hex(response.Value) << "\n";
-            payload << "variables=" << Sha256Hex(variableStream.str()) << "\n";
-            return payload.str();
+            BYTE hash[32] = {};
+            DWORD hashSize = sizeof(hash);
+            bool hashOk = CertGetCertificateContextProperty(certContext, CERT_SHA256_HASH_PROP_ID, hash, &hashSize) == TRUE;
+            CertFreeCertificateContext(certContext);
+
+            if (!hashOk || hashSize == 0) {
+                throw std::runtime_error(TamperDetectedMessage());
+            }
+
+            std::string actual = NormalizeFingerprint(BytesToFingerprint(hash, hashSize));
+            std::string pinned = NormalizeFingerprint(PinnedCertSha256);
+            if (actual != pinned) {
+                throw std::runtime_error(TamperDetectedMessage());
+            }
         }
 
-        bool VerifyResponseSignature(const RequestContext& request, const ApiResponse& response) const {
-            if (!EnforceStrictSecurity) {
-                return true;
-            }
-
-            if (ResponseSigningPublicKeyPem.empty()) {
-                return false;
-            }
-
-            if (response.RequestNonce.empty() || response.ServerTimestamp.empty() || response.Signature.empty()) {
-                return false;
-            }
-
-            if (response.RequestNonce != request.Nonce) {
-                return false;
-            }
-
-            long long now = CurrentUnixTimeSeconds();
-            long long serverTime = 0;
-            try {
-                serverTime = std::stoll(response.ServerTimestamp);
-            }
-            catch (...) {
-                return false;
-            }
-
-            if (std::llabs(now - serverTime) > AllowedClockSkewSeconds) {
-                return false;
-            }
-
-            std::vector<BYTE> signature = Base64ToBytes(response.Signature);
-            if (signature.empty()) {
-                return false;
-            }
-
-            std::string pem = ResponseSigningPublicKeyPem;
-            const std::string header = "-----BEGIN PUBLIC KEY-----";
-            const std::string footer = "-----END PUBLIC KEY-----";
-
-            std::size_t headerPos = pem.find(header);
-            std::size_t footerPos = pem.find(footer);
-            if (headerPos != std::string::npos && footerPos != std::string::npos) {
-                pem = pem.substr(headerPos + header.length(), footerPos - (headerPos + header.length()));
-            }
-
-            pem.erase(std::remove_if(pem.begin(), pem.end(), [](unsigned char c) {
-                return std::isspace(c) != 0;
-                }), pem.end());
-
-            std::vector<BYTE> publicKeyDer = Base64ToBytes(pem);
-            if (publicKeyDer.empty()) {
-                return false;
-            }
-
-            CERT_PUBLIC_KEY_INFO* publicKeyInfo = nullptr;
-            DWORD publicKeyInfoSize = 0;
-            if (!CryptDecodeObjectEx(
-                X509_ASN_ENCODING,
-                X509_PUBLIC_KEY_INFO,
-                publicKeyDer.data(),
-                static_cast<DWORD>(publicKeyDer.size()),
-                CRYPT_DECODE_ALLOC_FLAG,
-                nullptr,
-                &publicKeyInfo,
-                &publicKeyInfoSize)) {
-                return false;
-            }
-
-            BCRYPT_KEY_HANDLE keyHandle = nullptr;
-            bool verified = false;
-
-            if (CryptImportPublicKeyInfoEx2(X509_ASN_ENCODING, publicKeyInfo, 0, nullptr, &keyHandle)) {
-                BCRYPT_PKCS1_PADDING_INFO paddingInfo{ BCRYPT_SHA256_ALGORITHM };
-                std::string payload = BuildSignaturePayload(request, response);
-                std::string digestHex = Sha256Hex(payload);
-
-                std::vector<BYTE> digest;
-                digest.reserve(digestHex.length() / 2);
-                for (std::size_t i = 0; i + 1 < digestHex.length(); i += 2) {
-                    unsigned int byteValue = 0;
-                    std::stringstream stream;
-                    stream << std::hex << digestHex.substr(i, 2);
-                    stream >> byteValue;
-                    digest.push_back(static_cast<BYTE>(byteValue));
-                }
-
-                verified = BCryptVerifySignature(
-                    keyHandle,
-                    &paddingInfo,
-                    digest.data(),
-                    static_cast<ULONG>(digest.size()),
-                    signature.data(),
-                    static_cast<ULONG>(signature.size()),
-                    BCRYPT_PAD_PKCS1) == 0;
-            }
-
-            if (keyHandle) {
-                BCryptDestroyKey(keyHandle);
-            }
-
-            if (publicKeyInfo) {
-                LocalFree(publicKeyInfo);
-            }
-
-            return verified;
-        }
-
-        std::string HttpRequest(const RequestContext& request) {
-            HINTERNET hInternet = InternetOpenA("TXA", INTERNET_OPEN_TYPE_DIRECT, nullptr, nullptr, 0);
-            if (!hInternet) {
+        std::string HttpRequest(const std::string& endpoint, const std::string& jsonBody) {
+            HINTERNET hSession = WinHttpOpen(L"TXA/1.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+            if (!hSession) {
                 return "";
             }
 
             DWORD timeoutMs = 15000;
-            InternetSetOptionA(hInternet, INTERNET_OPTION_CONNECT_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
-            InternetSetOptionA(hInternet, INTERNET_OPTION_SEND_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
-            InternetSetOptionA(hInternet, INTERNET_OPTION_RECEIVE_TIMEOUT, &timeoutMs, sizeof(timeoutMs));
+            WinHttpSetTimeouts(hSession, timeoutMs, timeoutMs, timeoutMs, timeoutMs);
 
-            HINTERNET hConnect = InternetConnectA(
-                hInternet,
-                ApiHost.c_str(),
-                INTERNET_DEFAULT_HTTPS_PORT,
-                nullptr,
-                nullptr,
-                INTERNET_SERVICE_HTTP,
-                0,
-                0);
-
+            std::wstring host = Utf8ToWide(ApiHost);
+            HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
             if (!hConnect) {
-                InternetCloseHandle(hInternet);
+                WinHttpCloseHandle(hSession);
                 return "";
             }
 
-            std::string path = "/" + request.Endpoint;
-            HINTERNET hRequest = HttpOpenRequestA(
+            std::wstring path = Utf8ToWide("/" + endpoint);
+            HINTERNET hRequest = WinHttpOpenRequest(
                 hConnect,
-                "POST",
+                L"POST",
                 path.c_str(),
                 nullptr,
-                nullptr,
-                nullptr,
-                INTERNET_FLAG_SECURE |
-                INTERNET_FLAG_RELOAD |
-                INTERNET_FLAG_NO_CACHE_WRITE |
-                INTERNET_FLAG_NO_AUTO_REDIRECT |
-                INTERNET_FLAG_NO_COOKIES,
-                0);
+                WINHTTP_NO_REFERER,
+                WINHTTP_DEFAULT_ACCEPT_TYPES,
+                WINHTTP_FLAG_SECURE);
 
             if (!hRequest) {
-                InternetCloseHandle(hConnect);
-                InternetCloseHandle(hInternet);
+                WinHttpCloseHandle(hConnect);
+                WinHttpCloseHandle(hSession);
                 return "";
             }
 
-            std::string headers =
-                "Content-Type: application/json\r\n"
-                "Accept: application/json\r\n"
-                "X-TXA-Nonce: " + request.Nonce + "\r\n"
-                "X-TXA-Timestamp: " + request.Timestamp + "\r\n";
-
-            BOOL sent = HttpSendRequestA(
+            static const wchar_t* headers = L"Content-Type: application/json\r\nAccept: application/json\r\n";
+            BOOL sent = WinHttpSendRequest(
                 hRequest,
-                headers.c_str(),
-                static_cast<DWORD>(headers.length()),
-                reinterpret_cast<LPVOID>(const_cast<char*>(request.JsonBody.data())),
-                static_cast<DWORD>(request.JsonBody.length()));
+                headers,
+                -1L,
+                reinterpret_cast<LPVOID>(const_cast<char*>(jsonBody.data())),
+                static_cast<DWORD>(jsonBody.size()),
+                static_cast<DWORD>(jsonBody.size()),
+                0);
 
-            std::string response;
-            if (sent) {
-                char buffer[4096];
-                DWORD bytesRead = 0;
-                while (InternetReadFile(hRequest, buffer, sizeof(buffer) - 1, &bytesRead) && bytesRead) {
-                    buffer[bytesRead] = 0;
-                    response += buffer;
-                }
+            if (!sent || !WinHttpReceiveResponse(hRequest, nullptr)) {
+                WinHttpCloseHandle(hRequest);
+                WinHttpCloseHandle(hConnect);
+                WinHttpCloseHandle(hSession);
+                return "";
             }
 
-            InternetCloseHandle(hRequest);
-            InternetCloseHandle(hConnect);
-            InternetCloseHandle(hInternet);
+            VerifyPinnedCertificate(hRequest);
+
+            std::string response;
+            DWORD available = 0;
+            do {
+                available = 0;
+                if (!WinHttpQueryDataAvailable(hRequest, &available)) {
+                    response.clear();
+                    break;
+                }
+
+                if (available == 0) {
+                    break;
+                }
+
+                std::vector<char> buffer(static_cast<std::size_t>(available) + 1, '\0');
+                DWORD bytesRead = 0;
+                if (!WinHttpReadData(hRequest, buffer.data(), available, &bytesRead)) {
+                    response.clear();
+                    break;
+                }
+
+                response.append(buffer.data(), bytesRead);
+            } while (available > 0);
+
+            WinHttpCloseHandle(hRequest);
+            WinHttpCloseHandle(hConnect);
+            WinHttpCloseHandle(hSession);
 
             return response;
         }
 
-        ApiResponse PerformSecureRequest(const RequestContext& request) {
-            std::string rawResponse = HttpRequest(request);
+        ApiResponse PerformRequest(const std::string& endpoint, const std::map<std::string, std::string>& fields) {
+            std::string rawResponse = HttpRequest(endpoint, BuildRequestJson(fields));
             if (rawResponse.empty()) {
-                throw std::runtime_error(TamperDetectedMessage());
+                throw std::runtime_error("Network error");
             }
-
-            ApiResponse response = ParseResponse(rawResponse);
-            if (!VerifyResponseSignature(request, response)) {
-                throw std::runtime_error(TamperDetectedMessage());
-            }
-
-            return response;
+            return ParseResponse(rawResponse);
         }
 
         void ShowError(const std::string& title, const std::string& message) {
@@ -745,23 +537,19 @@ namespace TXA {
         }
 
         bool CheckIfPaused() {
-            RequestContext request = CreateRequest("isapplicationpaused", {
+            ApiResponse result = PerformRequest("isapplicationpaused", {
                 {"secret", Secret},
                 {"appName", AppName}
                 });
-
-            ApiResponse result = PerformSecureRequest(request);
             return result.Success && result.Message == "APPLICATION_PAUSED";
         }
 
         std::pair<bool, std::string> CheckVersion() {
-            RequestContext request = CreateRequest("versioncheck", {
+            ApiResponse result = PerformRequest("versioncheck", {
                 {"secret", Secret},
                 {"appName", AppName},
                 {"appVersion", Version}
                 });
-
-            ApiResponse result = PerformSecureRequest(request);
             if (result.Success && result.Message == "VERSION_OK") {
                 return { true, Version };
             }
@@ -774,12 +562,10 @@ namespace TXA {
         }
 
         bool LoadAppVariables() {
-            RequestContext request = CreateRequest("getvariables", {
+            ApiResponse result = PerformRequest("getvariables", {
                 {"secret", Secret},
                 {"appName", AppName}
                 });
-
-            ApiResponse result = PerformSecureRequest(request);
             if (!result.Success || result.Message == "NO_VARIABLES") {
                 return false;
             }
@@ -789,63 +575,9 @@ namespace TXA {
             return true;
         }
 
-        void EnsureSecurityConfiguration() {
-            if (!EnforceStrictSecurity) {
-                return;
-            }
-
-            if (ResponseSigningPublicKeyPem.empty()) {
-                ShowError(_xor_("Security Alert").str(), TamperDetectedMessage());
-                ExitProcess(0);
-            }
-        }
-
     public:
         Auth(const std::string& name, const std::string& secret, const std::string& version)
             : AppName(name), Secret(secret), Version(version) {
-        }
-
-        void SetResponseSigningPublicKeyPem(const std::string& pem) {
-            ResponseSigningPublicKeyPem = TrimCopy(pem);
-        }
-
-        bool SetResponseSigningPublicKeyFromFile(const std::string& path) {
-            std::ifstream file(path, std::ios::in | std::ios::binary);
-            if (!file.is_open()) {
-                return false;
-            }
-
-            std::ostringstream buffer;
-            buffer << file.rdbuf();
-            ResponseSigningPublicKeyPem = TrimCopy(buffer.str());
-            return !ResponseSigningPublicKeyPem.empty();
-        }
-
-        bool LoadResponseSigningPublicKeyFromEnvironment(const std::string& envVar = "TXA_RESPONSE_SIGNING_PUBLIC_KEY_PEM") {
-            char* value = nullptr;
-            std::size_t size = 0;
-            if (_dupenv_s(&value, &size, envVar.c_str()) != 0 || !value || size == 0) {
-                if (value) {
-                    free(value);
-                }
-                return false;
-            }
-
-            ResponseSigningPublicKeyPem = TrimCopy(std::string(value));
-            free(value);
-            return !ResponseSigningPublicKeyPem.empty();
-        }
-
-        bool HasResponseSigningPublicKey() const {
-            return !ResponseSigningPublicKeyPem.empty();
-        }
-
-        void SetStrictSecurity(bool enabled) {
-            EnforceStrictSecurity = enabled;
-        }
-
-        void SetAllowedClockSkewSeconds(long long seconds) {
-            AllowedClockSkewSeconds = seconds > 0 ? seconds : 120;
         }
 
         void Init() {
@@ -853,8 +585,6 @@ namespace TXA {
                 ShowError("TXA Auth Error", "AppName/Secret/Version missing");
                 ExitProcess(0);
             }
-
-            EnsureSecurityConfiguration();
 
             std::thread([this]() {
                 try {
@@ -879,14 +609,14 @@ namespace TXA {
 
                     LoadAppVariables();
                     IsInitialized = true;
-                    SetResponseMessage("TXA SDK initialized with signed-response verification.");
+                    SetResponseMessage("TXA SDK initialized successfully.");
                 }
                 catch (const std::exception& ex) {
-                    ShowError(_xor_("Security Alert").str(), TamperDetectedMessage());
+                    ShowError("Initialization Failed", ex.what());
                     ExitProcess(0);
                 }
                 catch (...) {
-                    ShowError(_xor_("Security Alert").str(), TamperDetectedMessage());
+                    ShowError("Initialization Failed", "Initialization failed");
                     ExitProcess(0);
                 }
                 }).detach();
@@ -908,7 +638,7 @@ namespace TXA {
             }
 
             try {
-                RequestContext request = CreateRequest("login", {
+                ApiResponse apiResp = PerformRequest("login", {
                     {"username", username},
                     {"password", password},
                     {"secret", Secret},
@@ -916,8 +646,6 @@ namespace TXA {
                     {"appVersion", Version},
                     {"hwid", GetHWID()}
                     });
-
-                ApiResponse apiResp = PerformSecureRequest(request);
                 if (!apiResp.Success) {
                     SetResponseMessage(apiResp.Message.empty() ? "Login failed" : apiResp.Message);
                     result.Message = Response();
@@ -936,7 +664,7 @@ namespace TXA {
                 return result;
             }
             catch (const std::exception& ex) {
-                SetResponseMessage(TamperDetectedMessage());
+                SetResponseMessage(ex.what());
                 result.Message = Response();
                 return result;
             }
@@ -962,7 +690,7 @@ namespace TXA {
             }
 
             try {
-                RequestContext request = CreateRequest("register", {
+                ApiResponse apiResp = PerformRequest("register", {
                     {"username", username},
                     {"password", password},
                     {"licenseKey", license},
@@ -971,8 +699,6 @@ namespace TXA {
                     {"appVersion", Version},
                     {"hwid", GetHWID()}
                     });
-
-                ApiResponse apiResp = PerformSecureRequest(request);
                 if (!apiResp.Success) {
                     SetResponseMessage(apiResp.Message.empty() ? "Registration failed" : apiResp.Message);
                     result.Message = Response();
@@ -985,7 +711,7 @@ namespace TXA {
                 return result;
             }
             catch (const std::exception& ex) {
-                SetResponseMessage(TamperDetectedMessage());
+                SetResponseMessage(ex.what());
                 result.Message = Response();
                 return result;
             }
@@ -1043,14 +769,12 @@ namespace TXA {
             }
 
             try {
-                RequestContext request = CreateRequest("getvariable", {
+                ApiResponse apiResp = PerformRequest("getvariable", {
                     {"secret", Secret},
                     {"appName", AppName},
                     {"appVersion", Version},
                     {"varName", name}
                     });
-
-                ApiResponse apiResp = PerformSecureRequest(request);
                 if (!apiResp.Success) {
                     SetResponseMessage("Failed to get variable '" + name + "': " + apiResp.Message);
                     return "";
@@ -1070,7 +794,7 @@ namespace TXA {
                 return apiResp.Value;
             }
             catch (const std::exception& ex) {
-                SetResponseMessage(TamperDetectedMessage());
+                SetResponseMessage(ex.what());
                 return "";
             }
             catch (...) {
@@ -1095,7 +819,7 @@ namespace TXA {
                 return true;
             }
             catch (const std::exception& ex) {
-                SetResponseMessage(TamperDetectedMessage());
+                SetResponseMessage(ex.what());
                 return false;
             }
             catch (...) {
@@ -1117,6 +841,7 @@ namespace TXA {
         bool Initialized() { return IsInitialized; }
         bool LoggedIn() { return IsLoggedIn; }
         bool Active() { return IsApplicationActive; }
+
         bool VersionOk() { return IsVersionCorrect; }
         std::string ServerVer() { return ServerVersion; }
     };
